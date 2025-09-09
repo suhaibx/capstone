@@ -1,0 +1,107 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from datetime import timedelta
+from airflow.hooks.postgres_hook import PostgresHook
+
+# PostgreSQL connection ID configured in Airflow
+PG_CONN_ID = 'postgres_conn'
+
+default_args = {
+    'owner': 'kiwilytics',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=2),
+}
+
+# SQL queries as variables
+CREATE_TOTAL_REVENUE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS total_revenue (
+        order_date TIMESTAMP PRIMARY KEY,
+        daily_revenue NUMERIC,
+        total_orders INTEGER
+    )
+"""
+
+SELECT_AGG_QUERY="""
+            select 
+                o.orderdate as order_date,
+                count(o.orderid) as total_orders,
+                SUM( coalesce(od.quantity, 0) * coalesce(p.price,0)) as daily_revenue
+            from orders o
+            left join order_details od on od.orderid = o.orderid
+            left join products p on p.productid = od.productid 
+                group by orderdate order by o.orderdate asc
+        """
+
+UPSERT_DAILY_REVENUE_SQL = f"""
+    INSERT INTO total_revenue (order_date, total_orders, daily_revenue)
+    
+        {SELECT_AGG_QUERY}
+    ON CONFLICT (order_date) DO UPDATE SET
+        daily_revenue = EXCLUDED.daily_revenue,
+        total_orders = EXCLUDED.total_orders
+    """
+
+SELECT_DAILY_REVENUE_SQL = """
+    SELECT order_date, daily_revenue from total_revenue ;
+    """
+
+def get_conn():
+    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
+    return hook.get_conn()
+
+def create_total_revenue_table():
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(CREATE_TOTAL_REVENUE_TABLE_SQL)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def upsert_daily_revenue_data():
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(UPSERT_DAILY_REVENUE_SQL)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def plot_using_matplotlib(df):
+    from matplotlib import pyplot as plt
+    import pandas as pd
+    df['order_date'] = pd.to_datetime(df['order_date'])
+    df.plot(x='order_date')
+    plt.savefig('/home/kiwilytics/Downloads/daily_revenue.png')
+
+def plot_daily_revenue():
+    import pandas as pd
+    conn = get_conn()
+    df = pd.read_sql(SELECT_DAILY_REVENUE_SQL, conn)
+    plot_using_matplotlib(df)
+    conn.commit()
+    conn.close()    
+
+with DAG(
+    dag_id='postgres_daily_revenue',
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval='@daily',
+    catchup=False,
+    description='Daily revenue calculation',
+) as dag:
+
+    t1 = PythonOperator(
+        task_id='create_revenue_table',
+        python_callable=create_total_revenue_table
+    )
+
+    t2 = PythonOperator(
+        task_id='upsert_daily_revenue_data',
+        python_callable=upsert_daily_revenue_data
+    )
+
+    t3 = PythonOperator(
+        task_id='plot_daily_revenue',
+        python_callable=plot_daily_revenue
+    )
+    t1 >> t2 >> t3
